@@ -1,17 +1,56 @@
-# This file started out very inspired by huggingface/peft's own train_dreambooth.py example
-import argparse
-import logging 
+#!/usr/bin/env python3
+"""
+train_lora_lm.py
+LoRA fine-tuning script for causal language models (e.g. GPT-2).
+This file started out very inspired by huggingface/peft's own train_dreambooth.py example
+"""
 
-# Here compiling a list of the args code I'll need to copy in
-# I'll definitely need the default values
-# output_dir
-# logging_dir
-# seed
-# tokenizer name
+import os
+import math
+import argparse
+import logging
+from pathlib import Path
+
+import torch
+from torch.utils.data import DataLoader
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    get_scheduler,
+    set_seed,
+)
+from peft import LoraConfig, get_peft_model
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="LoRA fine-tuning for causal LM")
+
+    parser.add_argument("--model_name_or_path", type=str, default="gpt2")
+    parser.add_argument("--dataset_name", type=str, default="wikitext", help="HuggingFace dataset name")
+    parser.add_argument("--dataset_config", type=str, default="wikitext-2-raw-v1")
+    parser.add_argument("--logging_dir", type=str, default="../experiments/logs")
+    parser.add_argument("--num_train_epochs", type=int, default=3)
+    parser.add_argument("--learning_rate", type=float, default=2e-4)
+    parser.add_argument("--train_batch_size", type=int, default=4)
+    parser.add_argument("--eval_batch_size", type=int, default=4)
+    parser.add_argument("--max_train_steps", type=int, default=None)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--lr_scheduler_type", type=str, default="linear")
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--lora_r", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.1)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+
+    return parser.parse_args()
 
 # In 
 def main():
-    logging_dir = Path(args.output_dir, args.logging_dir)
+    logging_dir = Path(args.logging_dir)
+    os.makedirs(logging_dir, exist_ok=True)
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -20,76 +59,61 @@ def main():
         level=logging.INFO,
     )
 
-    if args.seed is not None:
-        set_seed(args.seed)
+    logger = logging.getLogger(__name__)
 
-    if args.tokenizer_name
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, revision=args.revision, use_fast=False)
-    elif args.pretrained_model_name_or_path(
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="tokenizer",
-            revision=args.revision,
-            use_fast=false,
-        )
-    )
+    set_seed(args.seed)
+
+    # Load tokenizer and model
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, revision=args.revision, use_fast=False)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
+    model.to(args.device)
+
+    # Now we get to use LoRA!
     
-    config = LoraConfig(
+    lora_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
-        target_modules=UNET_TARGET_MODULES,
-        lora_dropout=args.lora_dropout,
-        bias=args.lora_bias,
+        target_modules=["c_attn"], # Now this is interesting, is this common practice?
+        lora_dropout=args.lora_dropout, 
+        bias="none",
     )
 
-    unet = get_peft_model(unet, config)
-    unet.print_trainable_parameters()
-    print(unet)
+    model = get_peft_model(model, config)
+    model.print_trainable_parameters()
 
-    optimizer = optimizer_class(
-        params_to_optimize,
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
-    )
+    # Getting the dataset
+    raw_datasets = load_dataset(args.dataset_name, args.dataset_config)
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    def tokenizer_fn(examples):
+        return tokenizers(examples["text"], truncation=True, padding="max_length", max_length=128)
 
-    # Dataset and DataLoaders creation:
-    train_dataset = DreamBoothDataset(
-        instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
-        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_prompt=args.class_prompt,
-        tokenizer=tokenizer,
-        size=args.resolution,
-        center_crop=args.center_crop,
-    )
+    tokenized_datasets = raw_datasets.map(tokenize_fn, batched=True)
+    train_dataset = tokenized_datasets["train"]
+    eval_dataset = tokenized_datasets["validation"]
 
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=args.train_batch_size,
-        shuffle=True,
-        collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation),
-        num_workers=args.num_dataloader_workers,
-    )
+    train_dataloader = DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle=True)
+    eval_dataloader = DataLoader(eval_dataset, batch_size=args.eval_batch_size)
+
+    # Optimizer and LR scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+
+    if args.max_train_steps is None:
+        args.max_train_teps = args.num_train_epochs * num_update_steps_per_epoch
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
-        num_cycles=args.lr_num_cycles,
-        power=args.lr_power,
+        num_warmup_steps=args.lr_warmup_steps,
+        num_training_steps=args.max_train_steps
     )
     
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
-    
-    # Main loop
+    # Main loop time!
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
@@ -99,40 +123,50 @@ def main():
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
-    first_epoch = 0
 
     model = model.to(device)
 
-    for epoch in range(num_epochs):
+    for epoch in range(args.num_train_epochs):
         model.train()
         total_loss = 0
-        for step, batch in enumerate(tqdm(train_dataloader)):
+        for step, batch in enumerate(train_dataloader):
             batch = {k: v.to(device) for k, v in batch.items()}
 
             outputs = model(**batch)
-            loss = outputs.loss
-            total_loss += loss.detach().float()
+            loss = outputs.loss / args.gradient_accumulation_steps
             loss.backward()
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad()
+            total_loss += loss.detach().float()
 
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
+            
+        avg_train_loss = total_loss / len(train_dataloader)
+        logger.info(f"Epoch {epoch+1}: train loss = {avg_train_loss:.4f}")
+
+        # Periodic evaluation
         model.eval()
         eval_loss = 0
-        eval_preds = []
-        for step, batch in enumerate(tqdm(eval_dataloader)):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            with torch.no_grad():
-                outputs = model(**batch)
-            loss = outputs.loss
-            eval_loss += loss.detach().float()
-            eval_preds.extend(
-                tokenizer.batch_decode(torch.argmax(outputs.logits, -1).detach().cpu().numpy(), skip_special_tokens=True)
-            )
+        with torch.no_grad():
+            for batch in enumerate(eval_dataloader):
+                inputs = {k: v.to(device) for k, v in batch.items()}                
+                outputs = model(**inputs)
+                eval_loss += outputs.loss.items()                
 
         eval_epoch_loss = eval_loss / len(eval_dataloader)
         eval_ppl = torch.exp(eval_epoch_loss)
-        train_epoch_loss = total_loss / len(train_dataloader)
-        train_ppl = torch.exp(train_epoch_loss)
-        print(f"{epoch=}: {train_ppl=} {train_epoch_loss=} {eval_ppl=} {eval_epoch_loss=}")
+        print(f"Epoch {epoch+1}: eval loss = {eval_loss:.4f}, perplexity = {eval_ppl:.2f}")
 
+        # Save checkpoint
+        save_path = Path(args.output_dir) / f"checkpoint_epoch_{epoch}"
+        save_path.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(save_path)
+        tokenizer.save_pretrained(save_path)
+    
+    logger.info("Training complete")
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(args)
