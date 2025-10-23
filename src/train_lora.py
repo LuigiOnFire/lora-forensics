@@ -92,9 +92,6 @@ def main(args):
     tokenized_datasets = load_from_disk(args.dataset_dir)
     tokenizer.pad_token = tokenizer.eos_token
     
-    def tokenizer_fn(examples): 
-        return tokenizer(examples["text"], truncation=True, padding="max_length", max_length=128)
-
     # tokenized_datasets = raw_datasets.map(tokenizer_fn, batched=True)
     train_dataset = tokenized_datasets
 
